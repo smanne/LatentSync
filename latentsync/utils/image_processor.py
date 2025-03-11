@@ -33,12 +33,14 @@ def load_fixed_mask(resolution: int) -> torch.Tensor:
     mask_image = cv2.cvtColor(mask_image, cv2.COLOR_BGR2RGB)
     mask_image = cv2.resize(mask_image, (resolution, resolution), interpolation=cv2.INTER_LANCZOS4) / 255.0
     mask_image = rearrange(torch.from_numpy(mask_image), "h w c -> c h w")
-    return mask_image
+    # Ensure float32 precision
+    return mask_image.to(torch.float32)
 
 
 class ImageProcessor:
     def __init__(self, resolution: int = 512, mask: str = "fix_mask", device: str = "cpu", mask_image=None):
         self.resolution = resolution
+        self.device = device
         self.resize = transforms.Resize(
             (resolution, resolution), interpolation=transforms.InterpolationMode.BILINEAR, antialias=True
         )
@@ -55,7 +57,10 @@ class ImageProcessor:
             if mask_image is None:
                 self.mask_image = load_fixed_mask(resolution)
             else:
-                self.mask_image = mask_image
+                self.mask_image = mask_image.to(torch.float32)
+
+            # Move mask_image to the specified device
+            self.mask_image = self.mask_image.to(device=self.device, dtype=torch.float32)
 
             if device != "cpu":
                 self.fa = face_alignment.FaceAlignment(
@@ -63,7 +68,6 @@ class ImageProcessor:
                 )
                 self.face_mesh = None
             else:
-                # self.face_mesh = mp.solutions.face_mesh.FaceMesh(static_image_mode=True)  # Process single image
                 self.face_mesh = None
                 self.fa = None
 
@@ -145,15 +149,27 @@ class ImageProcessor:
             image, _, _ = self.affine_transform(image)
         else:
             image = self.resize(image)
+        
+        # Move image to the same device as mask_image and ensure float32
+        image = image.to(device=self.device, dtype=torch.float32)
         pixel_values = self.normalize(image / 255.0)
+        
+        # Ensure mask_image is on the correct device and dtype
+        if self.mask_image.device != self.device or self.mask_image.dtype != torch.float32:
+            self.mask_image = self.mask_image.to(device=self.device, dtype=torch.float32)
+            
         masked_pixel_values = pixel_values * self.mask_image
         return pixel_values, masked_pixel_values, self.mask_image[0:1]
 
     def prepare_masks_and_masked_images(self, images: Union[torch.Tensor, np.ndarray], affine_transform=False):
         if isinstance(images, np.ndarray):
-            images = torch.from_numpy(images)
+            images = torch.from_numpy(images).to(torch.float32)
         if images.shape[3] == 3:
             images = rearrange(images, "b h w c -> b c h w")
+        
+        # Move images to the correct device and ensure float32
+        images = images.to(device=self.device, dtype=torch.float32)
+        
         if self.mask == "fix_mask":
             results = [self.preprocess_fixed_mask_image(image, affine_transform=affine_transform) for image in images]
         else:

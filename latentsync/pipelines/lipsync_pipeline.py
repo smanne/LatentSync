@@ -129,7 +129,10 @@ class LipsyncPipeline(DiffusionPipeline):
         else:
             raise ImportError("Please install accelerate via `pip install accelerate`")
 
-        device = torch.device(f"cuda:{gpu_id}")
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device(f"cuda:{gpu_id}")
 
         for cpu_offloaded_model in [self.unet, self.text_encoder, self.vae]:
             if cpu_offloaded_model is not None:
@@ -193,8 +196,9 @@ class LipsyncPipeline(DiffusionPipeline):
             height // self.vae_scale_factor,
             width // self.vae_scale_factor,
         )
-        rand_device = "cpu" if device.type == "mps" else device
-        latents = torch.randn(shape, generator=generator, device=rand_device, dtype=dtype).to(device)
+        # Generate noise on CPU then move to device
+        latents = torch.randn(shape, generator=generator, device="cpu", dtype=dtype)
+        latents = latents.to(device)
         latents = latents.repeat(1, 1, num_frames, 1, 1)
 
         # scale the initial noise by the standard deviation required by the scheduler
@@ -265,9 +269,13 @@ class LipsyncPipeline(DiffusionPipeline):
         faces = []
         boxes = []
         affine_matrices = []
+        device = self._execution_device
         print(f"Affine transforming {len(video_frames)} faces...")
         for frame in tqdm.tqdm(video_frames):
             face, box, affine_matrix = self.image_processor.affine_transform(frame)
+            # Move face tensor to GPU immediately after transformation
+            if isinstance(face, torch.Tensor):
+                face = face.to(device)
             faces.append(face)
             boxes.append(box)
             affine_matrices.append(affine_matrix)
@@ -278,18 +286,40 @@ class LipsyncPipeline(DiffusionPipeline):
     def restore_video(self, faces, video_frames, boxes, affine_matrices):
         video_frames = video_frames[: faces.shape[0]]
         out_frames = []
+        device = faces.device
         print(f"Restoring {len(faces)} faces...")
-        for index, face in enumerate(tqdm.tqdm(faces)):
-            x1, y1, x2, y2 = boxes[index]
-            height = int(y2 - y1)
-            width = int(x2 - x1)
-            face = torchvision.transforms.functional.resize(face, size=(height, width), antialias=True)
-            face = rearrange(face, "c h w -> h w c")
-            face = (face / 2 + 0.5).clamp(0, 1)
-            face = (face * 255).to(torch.uint8).cpu().numpy()
-            # face = cv2.resize(face, (width, height), interpolation=cv2.INTER_LANCZOS4)
-            out_frame = self.image_processor.restorer.restore_img(video_frames[index], face, affine_matrices[index])
-            out_frames.append(out_frame)
+        
+        # Process faces in batches to improve GPU utilization
+        batch_size = 4  # Adjust based on available memory
+        for i in range(0, len(faces), batch_size):
+            batch_faces = faces[i:i + batch_size]
+            batch_boxes = boxes[i:i + batch_size]
+            batch_frames = video_frames[i:i + batch_size]
+            batch_matrices = affine_matrices[i:i + batch_size]
+            
+            batch_out = []
+            for face, box, frame, matrix in zip(batch_faces, batch_boxes, batch_frames, batch_matrices):
+                x1, y1, x2, y2 = box
+                height = int(y2 - y1)
+                width = int(x2 - x1)
+                
+                # Keep face on GPU until the last possible moment
+                face_resized = torchvision.transforms.functional.resize(
+                    face.cpu(),  # Move to CPU only for resize
+                    size=(height, width),
+                    antialias=True
+                )
+                face_resized = face_resized.to(device)
+                face_resized = rearrange(face_resized, "c h w -> h w c")
+                face_resized = (face_resized / 2 + 0.5).clamp(0, 1)
+                # Move to CPU only for final numpy conversion
+                face_resized = (face_resized * 255).to(torch.uint8).cpu().numpy()
+                
+                out_frame = self.image_processor.restorer.restore_img(frame, face_resized, matrix)
+                batch_out.append(out_frame)
+            
+            out_frames.extend(batch_out)
+            
         return np.stack(out_frames, axis=0)
 
     @torch.no_grad()
@@ -314,31 +344,36 @@ class LipsyncPipeline(DiffusionPipeline):
         callback_steps: Optional[int] = 1,
         **kwargs,
     ):
+        # Move models to GPU at the start
+        device = self._execution_device
+        self.vae.to(device)
+        self.unet.to(device)
+        
         is_train = self.unet.training
         self.unet.eval()
 
         check_ffmpeg_installed()
 
-        # 0. Define call parameters
-        batch_size = 1
-        device = self._execution_device
-        self.image_processor = ImageProcessor(height, mask=mask, device="cuda")
-        self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
-
-        faces, original_video_frames, boxes, affine_matrices = self.affine_transform_video(video_path)
-        audio_samples = read_audio(audio_path)
-
-        # 1. Default height and width to unet
+        # 0. Default height and width to resolution
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
 
-        # 2. Check inputs
+        # 1. Check inputs. Raise error if not correct
         self.check_inputs(height, width, callback_steps)
 
-        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-        # corresponds to doing no classifier free guidance.
-        do_classifier_free_guidance = guidance_scale > 1.0
+        # 2. Define call parameters
+        batch_size = 1
+
+        # Use CPU for face detection if MPS is being used
+        face_detection_device = "cpu" if str(device) == "mps" else str(device)
+        self.image_processor = ImageProcessor(height, mask=mask, device=face_detection_device)
+
+        faces, original_video_frames, boxes, affine_matrices = self.affine_transform_video(video_path)
+        audio_samples = read_audio(audio_path)
+        
+        # Move audio samples to GPU
+        if isinstance(audio_samples, torch.Tensor):
+            audio_samples = audio_samples.to(device)
 
         # 3. set timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -378,7 +413,7 @@ class LipsyncPipeline(DiffusionPipeline):
             if self.unet.add_audio_layer:
                 audio_embeds = torch.stack(whisper_chunks[i * num_frames : (i + 1) * num_frames])
                 audio_embeds = audio_embeds.to(device, dtype=weight_dtype)
-                if do_classifier_free_guidance:
+                if guidance_scale > 1.0:
                     null_audio_embeds = torch.zeros_like(audio_embeds)
                     audio_embeds = torch.cat([null_audio_embeds, audio_embeds])
             else:
@@ -398,7 +433,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 weight_dtype,
                 device,
                 generator,
-                do_classifier_free_guidance,
+                guidance_scale > 1.0,
             )
 
             # 8. Prepare image latents
@@ -407,7 +442,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 device,
                 weight_dtype,
                 generator,
-                do_classifier_free_guidance,
+                guidance_scale > 1.0,
             )
 
             # 9. Denoising loop
@@ -415,7 +450,7 @@ class LipsyncPipeline(DiffusionPipeline):
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for j, t in enumerate(timesteps):
                     # expand the latents if we are doing classifier free guidance
-                    latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                    latent_model_input = torch.cat([latents] * 2) if guidance_scale > 1.0 else latents
 
                     # concat latents, mask, masked_image_latents in the channel dimension
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
@@ -427,7 +462,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=audio_embeds).sample
 
                     # perform guidance
-                    if do_classifier_free_guidance:
+                    if guidance_scale > 1.0:
                         noise_pred_uncond, noise_pred_audio = noise_pred.chunk(2)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_audio - noise_pred_uncond)
 
